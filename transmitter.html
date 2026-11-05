@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alpha-channel BFSK transmitter</title>
+<style>
+:root {
+  --panel: rgba(244, 247, 250, 0.95);
+  --text: #18222e;
+  --muted: #566476;
+  --line: #c9d2dc;
+  --field: #ffffff;
+  --accent: #1f5f99;
+  --accent-text: #ffffff;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --panel: rgba(20, 27, 36, 0.95);
+    --text: #e3e9f0;
+    --muted: #93a2b4;
+    --line: #34404e;
+    --field: #0e141b;
+    --accent: #6aa8e0;
+    --accent-text: #08121c;
+    color-scheme: dark;
+  }
+}
+html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+body { font: 14px/1.45 "Avenir Next", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+#bg { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; will-change: opacity; }
+#panel {
+  position: fixed; top: 12px; left: 12px; box-sizing: border-box;
+  width: min(380px, calc(100% - 24px)); max-height: calc(100% - 24px); overflow: auto;
+  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 14px 16px;
+}
+#panel[hidden] { display: none; }
+h1 { font-size: 17px; margin: 0 0 4px; }
+p.note { color: var(--muted); margin: 0 0 12px; font-size: 13px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--muted); }
+label.wide { grid-column: 1 / -1; }
+label.check { flex-direction: row; align-items: center; gap: 6px; }
+input, select, textarea {
+  font: inherit; color: var(--text); background: var(--field);
+  border: 1px solid var(--line); border-radius: 5px; padding: 5px 7px;
+}
+textarea { resize: vertical; min-height: 44px; }
+.row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+button {
+  font: inherit; border: 1px solid var(--accent); border-radius: 5px; padding: 6px 12px;
+  background: transparent; color: var(--accent); cursor: pointer;
+}
+button.primary { background: var(--accent); color: var(--accent-text); }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+#status { margin-top: 10px; font-size: 13px; color: var(--muted); white-space: pre-line; }
+#warn { color: #c0392b; font-size: 13px; margin-top: 8px; }
+#tiny { position: fixed; right: 6px; bottom: 4px; font-size: 11px; color: rgba(255,255,255,.45); pointer-events: none; }
+</style>
+</head>
+<body>
+<img id="bg" alt="">
+<div id="tiny"></div>
+
+<div id="panel">
+  <h1>Alpha-channel BFSK transmitter</h1>
+  <p class="note">The picture’s opacity flickers at f0 for a 0 bit and f1 for a 1 bit. Press Esc or click the picture to stop and show this panel.</p>
+  <div class="grid">
+    <label>f0, bit 0 (Hz)<input id="f0" type="number" step="0.5" value="5"></label>
+    <label>f1, bit 1 (Hz)<input id="f1" type="number" step="0.5" value="10"></label>
+    <label>Bit duration (ms)<input id="tb" type="number" step="10" value="400"></label>
+    <label>Δα<select id="delta"><option>0.1</option><option selected>0.5</option><option>0.2</option><option>0.3</option></select></label>
+    <label>Mode<select id="mode"><option value="text">Text message</option><option value="ber">BER test (PRBS)</option></select></label>
+    <label>BER payload (bytes)<input id="berBytes" type="number" min="1" max="255" value="16"></label>
+    <label class="wide">Message<textarea id="msg">HELLO</textarea></label>
+    <label>Gap between packets (s)<input id="gap" type="number" step="0.5" value="2"></label>
+    <label>Packets to send<input id="reps" type="number" min="1" value="5"></label>
+    <label class="wide">Background picture<input id="file" type="file" accept="image/*"></label>
+    <label class="check"><input id="hide" type="checkbox" checked>Hide panel while sending</label>
+  </div>
+  <div id="warn"></div>
+  <div class="row">
+    <button class="primary" id="send">Start sending</button>
+    <button id="fs">Full screen</button>
+  </div>
+  <div id="status"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const PREAMBLE = [1, 0, 1, 1, 0, 0, 1, 0];
+
+// Shared with receiver.html: 16-bit Galois LFSR, fixed seed, so both sides know the BER test payload.
+function prbsBytes(n) {
+  let s = 0xACE1; const out = [];
+  for (let i = 0; i < n; i++) {
+    let b = 0;
+    for (let k = 0; k < 8; k++) { const lsb = s & 1; s >>= 1; if (lsb) s ^= 0xB400; b = (b << 1) | lsb; }
+    out.push(b);
+  }
+  return out;
+}
+const bytesToBits = bytes => bytes.flatMap(b => [7,6,5,4,3,2,1,0].map(k => (b >> k) & 1));
+
+// Default static picture (replace with any photo via the file input).
+const defaultSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900">
+<defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3b6ea5"/><stop offset="1" stop-color="#f2c38b"/></linearGradient></defs>
+<rect width="1600" height="900" fill="url(#s)"/><circle cx="1180" cy="330" r="90" fill="#fff1c9"/>
+<path d="M0 620 L260 430 L470 580 L760 360 L1050 600 L1300 470 L1600 640 L1600 900 L0 900Z" fill="#40566b"/>
+<path d="M0 720 Q400 640 800 720 T1600 700 L1600 900 L0 900Z" fill="#2c3d2f"/></svg>`;
+$('bg').src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(defaultSvg);
+$('file').onchange = e => { const f = e.target.files[0]; if (f) $('bg').src = URL.createObjectURL(f); };
+
+let tx = null;               // active transmission
+let refresh = 60, lastNow = 0;
+
+function cfg() {
+  return { f0: +$('f0').value, f1: +$('f1').value, Tb: +$('tb').value / 1000, delta: +$('delta').value,
+           mode: $('mode').value, gap: +$('gap').value, reps: Math.max(1, +$('reps').value) };
+}
+function checkCfg() {
+  const c = cfg(), w = [];
+  const nyq = refresh / 2;
+  if (c.f0 > nyq || c.f1 > nyq) w.push(`Tones above ${nyq.toFixed(0)} Hz cannot be shown on a ${refresh.toFixed(0)} Hz screen.`);
+  if (Math.abs(c.f1 - c.f0) * c.Tb < 0.99) w.push(`|f1 − f0| × bit duration < 1: tones overlap within one bit. Use bit duration ≥ ${(1000 / Math.abs(c.f1 - c.f0)).toFixed(0)} ms.`);
+  $('warn').textContent = w.join(' ');
+}
+['f0','f1','tb'].forEach(id => $(id).addEventListener('input', checkCfg));
+
+function buildPacket(c) {
+  const payload = c.mode === 'text'
+    ? Array.from(new TextEncoder().encode($('msg').value)).slice(0, 255)
+    : prbsBytes(Math.min(255, Math.max(1, +$('berBytes').value)));
+  return [...PREAMBLE, ...bytesToBits([payload.length]), ...bytesToBits(payload)];
+}
+
+function start() {
+  const c = cfg();
+  const bits = buildPacket(c);
+  tx = { ...c, bits, start: performance.now() + c.gap * 1000, sent: 0 };
+  const secs = bits.length * c.Tb;
+  $('status').textContent = `Sending ${c.reps} packet(s) of ${bits.length} bits (${bits.length - 16} payload), ` +
+    `${secs.toFixed(1)} s each, raw rate ${(1 / c.Tb).toFixed(2)} bit/s.`;
+  if ($('hide').checked) $('panel').hidden = true;
+}
+function stop(msg) {
+  tx = null; $('panel').hidden = false; $('tiny').textContent = '';
+  if (msg) $('status').textContent = msg;
+}
+
+function frame(now) {
+  if (lastNow) refresh = 0.95 * refresh + 0.05 * (1000 / Math.max(1, now - lastNow));
+  lastNow = now;
+  const c = tx || cfg();
+  let alpha = 1 - c.delta / 2;                  // idle level = mean level while sending, so no DC jump
+  if (tx) {
+    const t = (now - tx.start) / 1000;
+    const k = Math.floor(t / tx.Tb);
+    if (t >= 0 && k < tx.bits.length) {
+      const f = tx.bits[k] ? tx.f1 : tx.f0;
+      alpha = Math.sin(2 * Math.PI * f * t + 1e-3) >= 0 ? 1 : 1 - tx.delta;   // square wave between 1 and 1−Δα
+      $('tiny').textContent = `${tx.sent + 1}/${tx.reps} · bit ${k + 1}/${tx.bits.length}`;
+    } else if (t >= tx.bits.length * tx.Tb) {
+      tx.sent++;
+      if (tx.sent >= tx.reps) stop(`Sent ${tx.reps} packet(s).`);
+      else tx.start = now + tx.gap * 1000;
+    }
+  }
+  $('bg').style.opacity = alpha;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+$('send').onclick = start;
+$('fs').onclick = () => document.documentElement.requestFullscreen?.();
+$('bg').onclick = () => tx ? stop('Stopped.') : null;
+document.addEventListener('keydown', e => { if (e.key === 'Escape') stop(tx ? 'Stopped.' : ''); });
+setInterval(() => { if (!tx) { checkCfg(); if (!$('status').textContent) $('status').textContent = `Display refresh ≈ ${refresh.toFixed(0)} Hz`; } }, 1000);
+</script>
+</body>
+</html>

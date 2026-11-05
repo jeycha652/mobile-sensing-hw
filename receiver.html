@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Alpha-channel BFSK receiver</title>
+<style>
+:root {
+  --bg: #eef2f5; --surface: #ffffff; --text: #18222e; --muted: #566476; --line: #c9d2dc;
+  --accent: #1f5f99; --accent-text: #ffffff; --ok: #1d7a46; --bad: #b3361f; --trace: #1f5f99;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1319; --surface: #16202a; --text: #e3e9f0; --muted: #93a2b4; --line: #34404e;
+    --accent: #6aa8e0; --accent-text: #08121c; --ok: #5fc48b; --bad: #ee8a74; --trace: #6aa8e0;
+    color-scheme: dark;
+  }
+}
+:root { box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 14px/1.45 "Avenir Next", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+main { max-width: 720px; margin: 0 auto; padding: 12px; }
+h1 { font-size: 17px; margin: 4px 0 10px; }
+.box { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+.cam { position: relative; }
+video { width: 100%; display: block; border-radius: 6px; background: #000; }
+#roi { position: absolute; border: 2px solid #ffd54a; pointer-events: none; box-sizing: border-box; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px 12px; }
+label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--muted); }
+input, select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 5px 7px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+button { font: inherit; border: 1px solid var(--accent); border-radius: 5px; padding: 7px 12px; background: transparent; color: var(--accent); cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-text); }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#plot { width: 100%; height: 110px; display: block; }
+#live { font-size: 13px; color: var(--muted); margin-top: 6px; }
+#msg { font-size: 22px; font-weight: 600; min-height: 1.5em; word-break: break-all; }
+#detail { font-size: 13px; color: var(--muted); white-space: pre-line; }
+.ok { color: var(--ok); } .bad { color: var(--bad); }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: right; white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Alpha-channel BFSK receiver</h1>
+
+  <div class="box cam">
+    <video id="video" playsinline muted></video>
+    <div id="roi"></div>
+  </div>
+
+  <div class="box">
+    <div class="grid">
+      <label>f0 (Hz)<input id="f0" type="number" step="0.5" value="5"></label>
+      <label>f1 (Hz)<input id="f1" type="number" step="0.5" value="10"></label>
+      <label>Bit duration (ms)<input id="tb" type="number" step="10" value="400"></label>
+      <label>Mode<select id="mode"><option value="text">Text message</option><option value="ber">BER test (PRBS)</option></select></label>
+      <label>BER payload (bytes)<input id="berBytes" type="number" min="1" max="255" value="16"></label>
+      <label>Measurement area (% of frame)<input id="roiPct" type="number" min="5" max="100" value="40"></label>
+      <label>Camera fps request<select id="fpsReq"><option>30</option><option selected>60</option><option>120</option></select></label>
+      <label>Detection threshold (× noise)<input id="k" type="number" step="0.5" value="4"></label>
+      <label>Label: Δα<input id="labDelta" value="0.5"></label>
+      <label>Label: distance (cm)<input id="labDist" value="20"></label>
+    </div>
+    <div class="row">
+      <button class="primary" id="startBtn">Start camera</button>
+      <button id="lockBtn">Lock exposure &amp; focus</button>
+      <button id="csvBtn">Download results CSV</button>
+      <button id="clearBtn">Clear results</button>
+    </div>
+  </div>
+
+  <div class="box">
+    <canvas id="plot"></canvas>
+    <div id="live">Camera off.</div>
+  </div>
+
+  <div class="box">
+    <div id="msg"></div>
+    <div id="detail">Waiting for a packet.</div>
+  </div>
+
+  <div class="box table-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Δα</th><th>cm</th><th>Bit ms</th><th>Bits</th><th>Errors</th><th>BER</th><th>Data rate (bit/s)</th><th>Preamble</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const PREAMBLE = [1, 0, 1, 1, 0, 0, 1, 0];
+const HEADER_BITS = 16;               // 8 preamble + 8 length
+
+function prbsBytes(n) {               // identical to transmitter.html
+  let s = 0xACE1; const out = [];
+  for (let i = 0; i < n; i++) {
+    let b = 0;
+    for (let k = 0; k < 8; k++) { const lsb = s & 1; s >>= 1; if (lsb) s ^= 0xB400; b = (b << 1) | lsb; }
+    out.push(b);
+  }
+  return out;
+}
+const bytesToBits = bytes => bytes.flatMap(b => [7,6,5,4,3,2,1,0].map(k => (b >> k) & 1));
+const bitsToBytes = bits => { const o = []; for (let i = 0; i + 8 <= bits.length; i += 8) o.push(bits.slice(i, i + 8).reduce((a, b) => (a << 1) | b, 0)); return o; };
+
+// ------------------------------------------------------------------ sampling
+const T = [], V = [];                 // timestamps (s) and mean ROI luminance
+const BUF_S = 90;
+const video = $('video');
+const work = document.createElement('canvas'); work.width = 64; work.height = 48;
+const wctx = work.getContext('2d', { willReadFrequently: true });
+let stream = null, fps = 0, lastT = 0;
+
+function cfg() {
+  return { f0: +$('f0').value, f1: +$('f1').value, Tb: +$('tb').value / 1000, mode: $('mode').value,
+           berBytes: Math.min(255, Math.max(1, +$('berBytes').value)), roi: Math.min(1, Math.max(0.05, +$('roiPct').value / 100)),
+           k: +$('k').value };
+}
+
+function placeRoi() {
+  const r = cfg().roi;
+  const vw = video.clientWidth, vh = video.clientHeight;
+  Object.assign($('roi').style, { left: 12 + vw * (1 - r) / 2 + 'px', top: 12 + vh * (1 - r) / 2 + 'px', width: vw * r + 'px', height: vh * r + 'px' });
+}
+
+function sample(tSec) {
+  if (tSec <= lastT) return;
+  const r = cfg().roi, vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return;
+  wctx.drawImage(video, vw * (1 - r) / 2, vh * (1 - r) / 2, vw * r, vh * r, 0, 0, 64, 48);
+  const d = wctx.getImageData(0, 0, 64, 48).data;
+  let s = 0;
+  for (let i = 0; i < d.length; i += 4) s += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  if (lastT) fps = 0.95 * fps + 0.05 / (tSec - lastT);
+  lastT = tSec;
+  T.push(tSec); V.push(s / (d.length / 4));
+  if (T.length > 200 && T[0] < tSec - BUF_S) { const n = T.findIndex(t => t >= tSec - BUF_S); T.splice(0, n); V.splice(0, n); }
+  process(tSec);
+}
+
+function loopRVFC(now, meta) {
+  sample((meta.captureTime ?? now) / 1000);
+  video.requestVideoFrameCallback(loopRVFC);
+}
+let lastMediaTime = -1;
+function loopRAF(now) {                // fallback: only take a sample when the video frame changed
+  if (video.currentTime !== lastMediaTime) { lastMediaTime = video.currentTime; sample(now / 1000); }
+  requestAnimationFrame(loopRAF);
+}
+
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: {
+      facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: +$('fpsReq').value } } });
+  } catch (e) {
+    $('live').textContent = `Camera unavailable: ${e.message}. The page must be served over HTTPS (e.g. GitHub Pages) and camera access allowed.`;
+    return;
+  }
+  video.srcObject = stream; await video.play();
+  setTimeout(placeRoi, 300);
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) video.requestVideoFrameCallback(loopRVFC);
+  else requestAnimationFrame(loopRAF);
+  $('startBtn').disabled = true;
+}
+
+async function lockCamera() {
+  if (!stream) return;
+  const track = stream.getVideoTracks()[0];
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  const adv = [];
+  if (caps.exposureMode?.includes('manual')) adv.push({ exposureMode: 'manual' });
+  if (caps.focusMode?.includes('manual')) adv.push({ focusMode: 'manual' });
+  if (caps.whiteBalanceMode?.includes('manual')) adv.push({ whiteBalanceMode: 'manual' });
+  try { if (adv.length) await track.applyConstraints({ advanced: adv }); }
+  catch (e) { /* not supported */ }
+  $('lockBtn').textContent = adv.length ? 'Locked: ' + adv.map(a => Object.keys(a)[0].replace('Mode', '')).join(', ') : 'Lock not supported here';
+}
+
+// ------------------------------------------------------------------ tone measurement
+function lb(x) { let lo = 0, hi = T.length; while (lo < hi) { const m = (lo + hi) >> 1; if (T[m] < x) lo = m + 1; else hi = m; } return lo; }
+
+// Amplitudes of tones f0, f1 in samples with timestamp in [s, e). A DFT evaluated at the real
+// timestamps, so jittery frame timing is handled; a straight line is removed first (exposure drift).
+function tones(s, e, f0, f1) {
+  const i0 = lb(s), i1 = lb(e), n = i1 - i0;
+  if (n < 4) return [0, 0, n];
+  let mt = 0, mv = 0;
+  for (let i = i0; i < i1; i++) { mt += T[i]; mv += V[i]; }
+  mt /= n; mv /= n;
+  let num = 0, den = 0;
+  for (let i = i0; i < i1; i++) { num += (T[i] - mt) * (V[i] - mv); den += (T[i] - mt) ** 2; }
+  const slope = den ? num / den : 0;
+  const out = [f0, f1].map(f => {
+    const w = 2 * Math.PI * f; let re = 0, im = 0;
+    for (let i = i0; i < i1; i++) { const x = V[i] - mv - slope * (T[i] - mt); re += x * Math.cos(w * T[i]); im -= x * Math.sin(w * T[i]); }
+    return 2 * Math.hypot(re, im) / n;
+  });
+  out.push(n);
+  return out;
+}
+
+function bitAt(c, tau, k) {
+  const g = 0.1 * c.Tb;
+  const [a0, a1] = tones(tau + k * c.Tb + g, tau + (k + 1) * c.Tb - g, c.f0, c.f1);
+  return { bit: a1 > a0 ? 1 : 0, d: (a1 - a0) / (a1 + a0 + 1e-9) };
+}
+
+// ------------------------------------------------------------------ packet state machine
+let state = 'idle', noise = null, trigT = 0, holdUntil = 0, pkt = null;
+let liveA = [0, 0];
+
+function process(now) {
+  const c = cfg();
+  const [a0, a1] = tones(now - c.Tb, now, c.f0, c.f1);
+  liveA = [a0, a1];
+  const a = Math.max(a0, a1);
+
+  if (state === 'idle' && now > holdUntil && T[0] < now - 3 * c.Tb) {
+    if (noise === null) noise = a;
+    const thr = Math.max(0.05, c.k * noise);
+    if (a > thr) { state = 'rx'; trigT = now; pkt = null; $('detail').textContent = 'Receiving…'; }
+    else noise = 0.97 * noise + 0.03 * a;          // track the noise floor only while idle
+  }
+
+  if (state === 'rx' && !pkt && now > trigT + (HEADER_BITS + 0.5) * c.Tb) {
+    // Symbol timing: the trigger fires somewhere in the first bit, so search the start time
+    // tau in [trigT − 1.5 Tb, trigT + 0.25 Tb] for the best match to the known preamble.
+    let best = { score: -Infinity, tau: 0 };
+    for (let tau = trigT - 1.5 * c.Tb; tau <= trigT + 0.25 * c.Tb; tau += c.Tb / 20) {
+      let score = 0;
+      PREAMBLE.forEach((b, k) => { score += (2 * b - 1) * bitAt(c, tau, k).d; });
+      if (score > best.score) best = { score, tau };
+    }
+    const pre = PREAMBLE.map((_, k) => bitAt(c, best.tau, k).bit);
+    const matched = pre.filter((b, k) => b === PREAMBLE[k]).length;
+    if (matched < 7) {                             // false trigger or unreadable packet
+      $('detail').textContent = `Preamble not found (${matched}/8 bits matched). Waiting for a packet.`;
+      state = 'idle'; holdUntil = now + c.Tb; return;
+    }
+    const lenBits = Array.from({ length: 8 }, (_, i) => bitAt(c, best.tau, 8 + i).bit);
+    let len = bitsToBytes(lenBits)[0];
+    if (c.mode === 'ber') len = c.berBytes;        // in BER test the payload size is known
+    pkt = { tau: best.tau, len, matched, total: HEADER_BITS + 8 * len };
+  }
+
+  if (state === 'rx' && pkt && now > pkt.tau + (pkt.total + 0.2) * c.Tb) {
+    const bits = Array.from({ length: 8 * pkt.len }, (_, i) => bitAt(c, pkt.tau, HEADER_BITS + i).bit);
+    report(c, bits, pkt);
+    state = 'idle'; holdUntil = now + c.Tb; pkt = null;
+  }
+}
+
+// ------------------------------------------------------------------ results
+const results = [];
+function report(c, bits, p) {
+  const time = new Date().toLocaleTimeString();
+  if (c.mode === 'text') {
+    const text = new TextDecoder().decode(new Uint8Array(bitsToBytes(bits)));
+    $('msg').textContent = text;
+    $('detail').textContent = `${p.len} bytes at ${(1 / c.Tb).toFixed(2)} bit/s, preamble ${p.matched}/8.`;
+    return;
+  }
+  const ref = bytesToBits(prbsBytes(c.berBytes));
+  const errors = bits.reduce((n, b, i) => n + (b !== ref[i]), 0);
+  const ber = errors / ref.length;
+  const rate = (ref.length - errors) / (ref.length * c.Tb);   // correctly received payload bits per second
+  $('msg').innerHTML = `BER <span class="${ber < 0.01 ? 'ok' : 'bad'}">${ber.toFixed(4)}</span>`;
+  $('detail').textContent = `${errors} errors in ${ref.length} bits, data rate ${rate.toFixed(2)} bit/s, preamble ${p.matched}/8.`;
+  const row = { time, delta: $('labDelta').value, dist: $('labDist').value, tbms: Math.round(c.Tb * 1000),
+                bits: ref.length, errors, ber, rate, pre: p.matched };
+  results.push(row);
+  $('rows').insertAdjacentHTML('afterbegin', `<tr><td>${time}</td><td>${row.delta}</td><td>${row.dist}</td><td>${row.tbms}</td>
+    <td>${row.bits}</td><td>${errors}</td><td>${ber.toFixed(4)}</td><td>${rate.toFixed(2)}</td><td>${row.pre}/8</td></tr>`);
+}
+function downloadCsv() {
+  const head = 'time,delta_alpha,distance_cm,bit_ms,bits,errors,ber,data_rate_bps,preamble_match\n';
+  const body = results.map(r => [r.time, r.delta, r.dist, r.tbms, r.bits, r.errors, r.ber.toFixed(5), r.rate.toFixed(3), r.pre].join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([head + body], { type: 'text/csv' }));
+  a.download = 'alpha_bfsk_results.csv'; a.click();
+}
+
+// ------------------------------------------------------------------ live plot
+const plot = $('plot'), pctx = plot.getContext('2d');
+function draw() {
+  const dpr = devicePixelRatio || 1, w = plot.clientWidth, h = plot.clientHeight;
+  if (plot.width !== w * dpr) { plot.width = w * dpr; plot.height = h * dpr; }
+  pctx.setTransform(dpr, 0, 0, dpr, 0, 0); pctx.clearRect(0, 0, w, h);
+  if (T.length > 2) {
+    const tEnd = T[T.length - 1], i0 = lb(tEnd - 5);
+    let lo = Infinity, hi = -Infinity;
+    for (let i = i0; i < T.length; i++) { lo = Math.min(lo, V[i]); hi = Math.max(hi, V[i]); }
+    const span = Math.max(hi - lo, 0.5);
+    pctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--trace');
+    pctx.lineWidth = 1.5; pctx.beginPath();
+    for (let i = i0; i < T.length; i++) {
+      const x = (T[i] - (tEnd - 5)) / 5 * w, y = h - 4 - (V[i] - lo) / span * (h - 8);
+      i === i0 ? pctx.moveTo(x, y) : pctx.lineTo(x, y);
+    }
+    pctx.stroke();
+    const c = cfg();
+    const alias = f => Math.abs(f - fps * Math.round(f / fps));
+    let warn = '';
+    if (fps > 1 && Math.abs(alias(c.f0) - alias(c.f1)) < 1 / c.Tb) warn = ' · f0 and f1 alias to nearly the same frequency at this frame rate';
+    $('live').textContent = `${fps.toFixed(1)} fps · level ${V[V.length - 1].toFixed(1)} (5 s range ${span.toFixed(1)}) · ` +
+      `A(f0) ${liveA[0].toFixed(2)} · A(f1) ${liveA[1].toFixed(2)} · noise ${(noise ?? 0).toFixed(2)} · ${state}${warn}`;
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+$('startBtn').onclick = startCamera;
+$('lockBtn').onclick = lockCamera;
+$('csvBtn').onclick = downloadCsv;
+$('clearBtn').onclick = () => { results.length = 0; $('rows').innerHTML = ''; };
+$('roiPct').oninput = placeRoi;
+addEventListener('resize', placeRoi);
+</script>
+</body>
+</html>
