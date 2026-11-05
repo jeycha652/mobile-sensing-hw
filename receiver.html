@@ -46,7 +46,7 @@ th:first-child, td:first-child { text-align: left; }
 </head>
 <body>
 <main>
-  <h1>Alpha-channel BFSK receiver</h1>
+  <h1>Alpha-channel BFSK receiver <small style="font-weight:400;color:var(--muted)">v2</small></h1>
 
   <div class="box cam">
     <video id="video" playsinline muted></video>
@@ -71,6 +71,7 @@ th:first-child, td:first-child { text-align: left; }
       <button id="lockBtn">Lock exposure &amp; focus</button>
       <button id="csvBtn">Download results CSV</button>
       <button id="clearBtn">Clear results</button>
+      <button id="resetBtn">Reset receiver</button>
     </div>
   </div>
 
@@ -96,6 +97,7 @@ th:first-child, td:first-child { text-align: left; }
 const $ = id => document.getElementById(id);
 const PREAMBLE = [1, 0, 1, 1, 0, 0, 1, 0];
 const HEADER_BITS = 16;               // 8 preamble + 8 length
+const MAX_TEXT_BYTES = 32;            // longer text lengths are treated as a misread header
 
 function prbsBytes(n) {               // identical to transmitter.html
   let s = 0xACE1; const out = [];
@@ -224,7 +226,7 @@ function process(now) {
   if (state === 'idle' && now > holdUntil && T[0] < now - 3 * c.Tb) {
     if (noise === null) noise = a;
     const thr = Math.max(0.05, c.k * noise);
-    if (a > thr) { state = 'rx'; trigT = now; pkt = null; $('detail').textContent = 'Receiving…'; }
+    if (a > thr) { state = 'rx'; trigT = now; pkt = null; $('detail').textContent = 'Signal detected, looking for the preamble…'; }
     else noise = 0.97 * noise + 0.03 * a;          // track the noise floor only while idle
   }
 
@@ -246,7 +248,13 @@ function process(now) {
     const lenBits = Array.from({ length: 8 }, (_, i) => bitAt(c, best.tau, 8 + i).bit);
     let len = bitsToBytes(lenBits)[0];
     if (c.mode === 'ber') len = c.berBytes;        // in BER test the payload size is known
+    else if (len === 0 || len > MAX_TEXT_BYTES) {  // a misread length would make us wait for minutes
+      $('detail').textContent = `Header misread (length ${len} bytes). Waiting for the next packet.`;
+      state = 'idle'; holdUntil = now + c.Tb; return;
+    }
     pkt = { tau: best.tau, len, matched, total: HEADER_BITS + 8 * len };
+    const left = pkt.tau + pkt.total * c.Tb - now;
+    $('detail').textContent = `Preamble found (${matched}/8). Receiving ${len} byte(s), about ${left.toFixed(0)} s left…`;
   }
 
   if (state === 'rx' && pkt && now > pkt.tau + (pkt.total + 0.2) * c.Tb) {
@@ -319,6 +327,7 @@ $('startBtn').onclick = startCamera;
 $('lockBtn').onclick = lockCamera;
 $('csvBtn').onclick = downloadCsv;
 $('clearBtn').onclick = () => { results.length = 0; $('rows').innerHTML = ''; };
+$('resetBtn').onclick = () => { state = 'idle'; pkt = null; noise = null; holdUntil = 0; $('detail').textContent = 'Waiting for a packet.'; };
 $('roiPct').oninput = placeRoi;
 addEventListener('resize', placeRoi);
 </script>
