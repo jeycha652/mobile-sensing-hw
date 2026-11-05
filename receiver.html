@@ -46,7 +46,7 @@ th:first-child, td:first-child { text-align: left; }
 </head>
 <body>
 <main>
-  <h1>Alpha-channel BFSK receiver <small style="font-weight:400;color:var(--muted)">v2</small></h1>
+  <h1>Alpha-channel BFSK receiver <small style="font-weight:400;color:var(--muted)">v3</small></h1>
 
   <div class="box cam">
     <video id="video" playsinline muted></video>
@@ -83,6 +83,7 @@ th:first-child, td:first-child { text-align: left; }
   <div class="box">
     <div id="msg"></div>
     <div id="detail">Waiting for a packet.</div>
+    <pre id="log" style="margin:8px 0 0;font-size:12px;color:var(--muted);white-space:pre-wrap"></pre>
   </div>
 
   <div class="box table-wrap">
@@ -210,57 +211,75 @@ function tones(s, e, f0, f1) {
 function bitAt(c, tau, k) {
   const g = 0.1 * c.Tb;
   const [a0, a1] = tones(tau + k * c.Tb + g, tau + (k + 1) * c.Tb - g, c.f0, c.f1);
-  return { bit: a1 > a0 ? 1 : 0, d: (a1 - a0) / (a1 + a0 + 1e-9) };
+  return { bit: a1 > a0 ? 1 : 0, d: (a1 - a0) / (a1 + a0 + 1e-9), a: Math.max(a0, a1) };
 }
 
 // ------------------------------------------------------------------ packet state machine
-let state = 'idle', noise = null, trigT = 0, holdUntil = 0, pkt = null;
+// The preamble search is a sliding correlator over the recorded samples: every candidate start
+// time is tested against the known 8-bit preamble. The receiver therefore keeps catching packets
+// after a missed or rejected one, and a brightness jump only spoils the packet it lands in.
+let state = 'scan', scanTau = null, best = null, pkt = null, noise = null;
 let liveA = [0, 0];
+const logLines = [];
+function note(msg) {
+  logLines.unshift(`${new Date().toLocaleTimeString()}  ${msg}`);
+  logLines.length = Math.min(logLines.length, 10);
+  const el = $('log'); if (el) el.textContent = logLines.join('\n');
+}
+function preambleAt(c, tau) {
+  let score = 0, matched = 0, amp = 0;
+  for (let k = 0; k < 8; k++) {
+    const r = bitAt(c, tau, k);
+    score += (2 * PREAMBLE[k] - 1) * r.d; matched += r.bit === PREAMBLE[k] ? 1 : 0; amp += r.a;
+  }
+  return { score, matched, amp: amp / 8 };
+}
 
 function process(now) {
   const c = cfg();
   const [a0, a1] = tones(now - c.Tb, now, c.f0, c.f1);
   liveA = [a0, a1];
   const a = Math.max(a0, a1);
-
-  if (state === 'idle' && now > holdUntil && T[0] < now - 3 * c.Tb) {
-    if (noise === null) noise = a;
-    const thr = Math.max(0.05, c.k * noise);
-    if (a > thr) { state = 'rx'; trigT = now; pkt = null; $('detail').textContent = 'Signal detected, looking for the preamble…'; }
-    else noise = 0.97 * noise + 0.03 * a;          // track the noise floor only while idle
+  if (state === 'scan') {                         // noise floor: drops at once, rises slowly
+    if (noise === null || a < noise) noise = a; else noise += 0.0003 * (a - noise);   // ~1 min to rise
   }
 
-  if (state === 'rx' && !pkt && now > trigT + (HEADER_BITS + 0.5) * c.Tb) {
-    // Symbol timing: the trigger fires somewhere in the first bit, so search the start time
-    // tau in [trigT − 1.5 Tb, trigT + 0.25 Tb] for the best match to the known preamble.
-    let best = { score: -Infinity, tau: 0 };
-    for (let tau = trigT - 1.5 * c.Tb; tau <= trigT + 0.25 * c.Tb; tau += c.Tb / 20) {
-      let score = 0;
-      PREAMBLE.forEach((b, k) => { score += (2 * b - 1) * bitAt(c, tau, k).d; });
-      if (score > best.score) best = { score, tau };
+  if (state === 'scan') {
+    const step = c.Tb / 12, gate = Math.max(0.05, c.k * noise);
+    if (scanTau === null || scanTau < T[0]) scanTau = Math.max(T[0], now - 8 * c.Tb);
+    while (state === 'scan' && scanTau + 8 * c.Tb <= now) {
+      const p = preambleAt(c, scanTau);
+      if (p.score >= 3 && p.amp >= gate && (!best || p.score > best.score)) best = { tau: scanTau, ...p };
+      if (best && scanTau > best.tau + 0.5 * c.Tb) {   // passed the best alignment: lock on it
+        if (best.matched >= 7) {
+          state = 'header'; pkt = { tau: best.tau, matched: best.matched };
+          $('detail').textContent = `Preamble found (${best.matched}/8), reading header…`;
+        }
+        best = null;
+      }
+      scanTau += step;
     }
-    const pre = PREAMBLE.map((_, k) => bitAt(c, best.tau, k).bit);
-    const matched = pre.filter((b, k) => b === PREAMBLE[k]).length;
-    if (matched < 7) {                             // false trigger or unreadable packet
-      $('detail').textContent = `Preamble not found (${matched}/8 bits matched). Waiting for a packet.`;
-      state = 'idle'; holdUntil = now + c.Tb; return;
-    }
-    const lenBits = Array.from({ length: 8 }, (_, i) => bitAt(c, best.tau, 8 + i).bit);
-    let len = bitsToBytes(lenBits)[0];
-    if (c.mode === 'ber') len = c.berBytes;        // in BER test the payload size is known
-    else if (len === 0 || len > MAX_TEXT_BYTES) {  // a misread length would make us wait for minutes
-      $('detail').textContent = `Header misread (length ${len} bytes). Waiting for the next packet.`;
-      state = 'idle'; holdUntil = now + c.Tb; return;
-    }
-    pkt = { tau: best.tau, len, matched, total: HEADER_BITS + 8 * len };
-    const left = pkt.tau + pkt.total * c.Tb - now;
-    $('detail').textContent = `Preamble found (${matched}/8). Receiving ${len} byte(s), about ${left.toFixed(0)} s left…`;
   }
 
-  if (state === 'rx' && pkt && now > pkt.tau + (pkt.total + 0.2) * c.Tb) {
+  if (state === 'header' && now >= pkt.tau + (HEADER_BITS + 0.1) * c.Tb) {
+    const len = bitsToBytes(Array.from({ length: 8 }, (_, i) => bitAt(c, pkt.tau, 8 + i).bit))[0];
+    const ok = c.mode === 'ber' ? len === c.berBytes : (len > 0 && len <= MAX_TEXT_BYTES);
+    if (!ok) {
+      note(`Header check failed (length ${len}), still listening`);
+      $('detail').textContent = 'Waiting for a packet.';
+      state = 'scan'; scanTau = pkt.tau + 0.5 * c.Tb; pkt = null;
+    } else {
+      pkt.len = c.mode === 'ber' ? c.berBytes : len;
+      pkt.total = HEADER_BITS + 8 * pkt.len;
+      state = 'payload';
+      $('detail').textContent = `Preamble found (${pkt.matched}/8). Receiving ${pkt.len} byte(s), about ${(pkt.tau + pkt.total * c.Tb - now).toFixed(0)} s left…`;
+    }
+  }
+
+  if (state === 'payload' && now >= pkt.tau + (pkt.total + 0.1) * c.Tb) {
     const bits = Array.from({ length: 8 * pkt.len }, (_, i) => bitAt(c, pkt.tau, HEADER_BITS + i).bit);
     report(c, bits, pkt);
-    state = 'idle'; holdUntil = now + c.Tb; pkt = null;
+    state = 'scan'; scanTau = pkt.tau + pkt.total * c.Tb; pkt = null;
   }
 }
 
@@ -272,6 +291,7 @@ function report(c, bits, p) {
     const text = new TextDecoder().decode(new Uint8Array(bitsToBytes(bits)));
     $('msg').textContent = text;
     $('detail').textContent = `${p.len} bytes at ${(1 / c.Tb).toFixed(2)} bit/s, preamble ${p.matched}/8.`;
+    note(`Text received: ${text}`);
     return;
   }
   const ref = bytesToBits(prbsBytes(c.berBytes));
@@ -279,7 +299,8 @@ function report(c, bits, p) {
   const ber = errors / ref.length;
   const rate = (ref.length - errors) / (ref.length * c.Tb);   // correctly received payload bits per second
   $('msg').innerHTML = `BER <span class="${ber < 0.01 ? 'ok' : 'bad'}">${ber.toFixed(4)}</span>`;
-  $('detail').textContent = `${errors} errors in ${ref.length} bits, data rate ${rate.toFixed(2)} bit/s, preamble ${p.matched}/8.`;
+  $('detail').textContent = `${errors} errors in ${ref.length} bits, data rate ${rate.toFixed(2)} bit/s, preamble ${p.matched}/8. Listening for the next packet.`;
+  note(`Packet received: ${errors} errors in ${ref.length} bits`);
   const row = { time, delta: $('labDelta').value, dist: $('labDist').value, tbms: Math.round(c.Tb * 1000),
                 bits: ref.length, errors, ber, rate, pre: p.matched };
   results.push(row);
@@ -327,7 +348,7 @@ $('startBtn').onclick = startCamera;
 $('lockBtn').onclick = lockCamera;
 $('csvBtn').onclick = downloadCsv;
 $('clearBtn').onclick = () => { results.length = 0; $('rows').innerHTML = ''; };
-$('resetBtn').onclick = () => { state = 'idle'; pkt = null; noise = null; holdUntil = 0; $('detail').textContent = 'Waiting for a packet.'; };
+$('resetBtn').onclick = () => { state = 'scan'; scanTau = null; best = null; pkt = null; noise = null; $('detail').textContent = 'Waiting for a packet.'; note('Receiver reset'); };
 $('roiPct').oninput = placeRoi;
 addEventListener('resize', placeRoi);
 </script>
